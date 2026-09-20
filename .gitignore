@@ -1,0 +1,20 @@
+# Monorepo dependencies
+node_modules/
+**/node_modules/
+
+# Production builds
+client/dist/
+
+# Environment files
+.env
+*.env
+!.env.example
+
+# Playwright artifacts
+test-results/
+playwright-report/
+
+# Logs & System
+*.log
+.DS_Store
+Thumbs.db
