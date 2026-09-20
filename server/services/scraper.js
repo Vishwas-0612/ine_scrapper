@@ -23,7 +23,7 @@ function ensureBrowserInstalled() {
   if (isBrowserInstalled) return;
   try {
     console.log('[Scraper] Playwright browser missing at runtime. Auto-installing Playwright Chromium...');
-    execSync('npx playwright install chromium || npx playwright install', { stdio: 'inherit', env: { ...process.env, PLAYWRIGHT_BROWSERS_PATH: '0' } });
+    execSync('npx playwright install || npx playwright install chromium', { stdio: 'inherit', env: { ...process.env, PLAYWRIGHT_BROWSERS_PATH: '0' } });
     isBrowserInstalled = true;
     console.log('[Scraper] Runtime Playwright installation complete!');
   } catch (err) {
