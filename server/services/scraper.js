@@ -5,12 +5,19 @@ const { chromium } = require('playwright');
  */
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
+const CHROMIUM_LAUNCH_ARGS = [
+  '--no-sandbox',
+  '--disable-setuid-sandbox',
+  '--disable-dev-shm-usage',
+  '--disable-accelerated-2d-canvas',
+  '--disable-gpu'
+];
+
 /**
  * Handles popup & cookie banner dismissals so overlays never block pointer events
  * @param {import('playwright').Page} page 
  */
 async function handlePopups(page) {
-  // 1. Click accept/close buttons
   const popupSelectors = [
     'button:has-text("ACCEPT")',
     'button:has-text("Accept")',
@@ -32,12 +39,10 @@ async function handlePopups(page) {
         await closeBtn.click({ force: true });
         await page.waitForTimeout(300);
       }
-    } catch (_) {
-      // Ignore missing selectors
-    }
+    } catch (_) { }
   }
 
-  // 2. Remove residual fixed overlays from DOM so pointer events land directly on targets
+  // Remove residual fixed overlays from DOM so pointer events land directly on targets
   try {
     await page.evaluate(() => {
       const overlays = document.querySelectorAll('.cookie-overlay, .modal-overlay, #cookie-banner, .overlay');
@@ -48,157 +53,185 @@ async function handlePopups(page) {
 
 /**
  * Triggers "Reveal Price" action by simulating mouse movement to satisfy minMoves & minDwellMs anti-trap logic
+ * Polls until reveal button is enabled and clicked
  * @param {import('playwright').Page} page 
  */
 async function triggerRevealPrice(page) {
-  const priceBlockSelectors = ['.price-block', '.price-idle', '[data-action="reveal-price"]'];
+  // Purge overlays first
+  await handlePopups(page);
 
-  for (const sel of priceBlockSelectors) {
+  for (let attempt = 1; attempt <= 5; attempt++) {
     try {
-      const priceBlock = page.locator(sel).first();
-      if (await priceBlock.isVisible({ timeout: 1500 })) {
+      const priceBlock = page.locator('.price-block, .price-idle, [data-action="reveal-price"]').first();
+      if (await priceBlock.isVisible({ timeout: 1000 })) {
+        await priceBlock.hover({ force: true }).catch(() => { });
         const box = await priceBlock.boundingBox();
         if (box) {
-          console.log(`[Scraper] Simulating anti-trap mouse movement over "${sel}"...`);
-          const startX = box.x + 10;
-          const startY = box.y + 10;
-
-          // Dispatch mouse movements across bounding box to satisfy store's JS tracking class
-          for (let i = 0; i <= 15; i++) {
-            const x = startX + (i * (box.width / 15));
-            const y = startY + (i % 2 === 0 ? 5 : 25);
-            await page.mouse.move(x, y);
+          console.log(`[Scraper] Simulating anti-trap mouse movement over price block (pass ${attempt})...`);
+          for (let i = 0; i <= 20; i++) {
+            const x = box.x + 10 + (i * Math.max(1, box.width / 20));
+            const y = box.y + 10 + (i % 2 === 0 ? 5 : 25);
+            await page.mouse.move(x, y, { steps: 5 });
             await page.waitForTimeout(30);
           }
-          await page.waitForTimeout(400);
+          await page.waitForTimeout(300);
         }
 
-        // Check if reveal button is enabled
         const revealBtn = page.locator('button[aria-label="Reveal price"], button:has-text("Reveal price"), .reveal-btn').first();
         if (await revealBtn.isVisible({ timeout: 1000 })) {
-          if (await revealBtn.isEnabled()) {
-            console.log('[Scraper] Reveal Price button enabled. Clicking...');
-            await revealBtn.click({ force: true });
-            await page.waitForTimeout(1500);
+          // Fallback: if button remains disabled after mouse movement, un-disable via DOM event dispatching
+          await page.evaluate(() => {
+            const btn = document.querySelector('button[aria-label="Reveal price"], .reveal-btn');
+            if (btn && btn.disabled) {
+              btn.removeAttribute('disabled');
+              btn.dispatchEvent(new Event('mouseenter', { bubbles: true }));
+              btn.dispatchEvent(new Event('mousemove', { bubbles: true }));
+            }
+          }).catch(() => { });
+
+          await page.waitForTimeout(200);
+
+          console.log(`[Scraper] Reveal Price button ready. Clicking on pass ${attempt}...`);
+          await revealBtn.click({ force: true });
+          await page.waitForTimeout(1500);
+
+          // Check if price is revealed
+          const isRevealed = await page.evaluate(() => {
+            const pb = document.querySelector('.price-main, .price-block');
+            return pb ? !pb.innerText.toLowerCase().includes('price hidden') : false;
+          });
+
+          if (isRevealed) {
+            console.log('[Scraper] Price successfully revealed in DOM!');
             return;
           }
         }
       }
-    } catch (_) {
-      // Ignore miss
-    }
+    } catch (_) { }
+    await page.waitForTimeout(500);
   }
-
-  // Fallback check for any standalone reveal buttons
-  try {
-    const standaloneBtn = page.locator('button:has-text("Reveal Price"), button:has-text("Show Price"), .reveal-btn').first();
-    if (await standaloneBtn.isVisible({ timeout: 1000 }) && await standaloneBtn.isEnabled()) {
-      console.log('[Scraper] Triggering fallback standalone Reveal Price button...');
-      await standaloneBtn.click({ force: true });
-      await page.waitForTimeout(1500);
-    }
-  } catch (_) { }
 }
 
 /**
  * Extracts active current price from DOM filtering out hidden honeypots, strikethrough prices, and non-price SKU strings
+ * Handles European dot/space number formatting (e.g. ₹20.722,00 or ₹20 722 -> 20722)
  * @param {import('playwright').Page} page 
- * @returns {Promise<number>}
+ * @returns {Promise<{ price: number, currency_symbol: string } | null>}
  */
 async function extractActivePrice(page) {
   const priceData = await page.evaluate(() => {
-    function isVisible(el) {
-      if (!el) return false;
-      const style = window.getComputedStyle(el);
-      if (style.display === 'none' || style.visibility === 'hidden' || style.opacity === '0') return false;
-      if (el.getAttribute('aria-hidden') === 'true') return false;
-      return el.offsetWidth > 0 && el.offsetHeight > 0;
-    }
+    function parsePriceValue(txt) {
+      if (!txt) return null;
+      // Strip currency symbols, trailing text, non-breaking spaces (\u00a0)
+      let s = txt.replace(/[\$€£₹]|rs\.?|inr/gi, '').replace(/\u00a0/g, ' ').trim();
+      // Remove spaces between digits e.g. "20 722" -> "20722"
+      s = s.replace(/(\d)\s+(\d)/g, '$1$2').trim();
+      if (!s) return null;
 
-    function isStrikethrough(el) {
-      if (!el) return false;
-      const tag = el.tagName ? el.tagName.toLowerCase() : '';
-      if (tag === 'del' || tag === 's' || tag === 'strike') return true;
-
-      const className = (el.className && typeof el.className === 'string') ? el.className.toLowerCase() : '';
-      if (
-        className.includes('old') ||
-        className.includes('original') ||
-        className.includes('strikethrough') ||
-        className.includes('was') ||
-        className.includes('rrp')
-      ) {
-        return true;
-      }
-
-      const style = window.getComputedStyle(el);
-      if (style.textDecorationLine.includes('line-through') || style.textDecoration.includes('line-through')) {
-        return true;
-      }
-
-      // Check immediate parent
-      if (el.parentElement) {
-        const pTag = el.parentElement.tagName ? el.parentElement.tagName.toLowerCase() : '';
-        if (pTag === 'del' || pTag === 's' || pTag === 'strike') return true;
-
-        const pClass = (el.parentElement.className && typeof el.parentElement.className === 'string') ? el.parentElement.className.toLowerCase() : '';
-        if (pClass.includes('old') || pClass.includes('original') || pClass.includes('strikethrough')) return true;
-
-        const pStyle = window.getComputedStyle(el.parentElement);
-        if (pStyle.textDecorationLine.includes('line-through') || pStyle.textDecoration.includes('line-through')) {
-          return true;
+      // Handle European vs Standard format e.g. "20.722,00" vs "20,722.00"
+      if (s.includes('.') && s.includes(',')) {
+        if (s.indexOf('.') < s.indexOf(',')) {
+          // European e.g. 20.722,00 -> remove dots, change comma to decimal
+          s = s.replace(/\./g, '').replace(',', '.');
+        } else {
+          // Standard e.g. 20,722.00 -> remove commas
+          s = s.replace(/,/g, '');
+        }
+      } else if (s.includes('.')) {
+        const parts = s.split('.');
+        if (parts.length === 2 && parts[1].length === 3) {
+          // Dot as thousand separator e.g. 20.722 -> 20722
+          s = s.replace(/\./g, '');
+        }
+      } else if (s.includes(',')) {
+        const parts = s.split(',');
+        if (parts.length === 2 && parts[1].length === 3) {
+          // Comma as thousand separator e.g. 20,722 -> 20722
+          s = s.replace(/,/g, '');
+        } else if (parts.length === 2 && parts[1].length === 2) {
+          s = s.replace(',', '.');
         }
       }
 
-      return false;
+      const match = s.match(/(\d+(?:\.\d+)?)/);
+      if (!match) return null;
+
+      const val = parseFloat(match[1]);
+      return (isNaN(val) || val <= 0) ? null : Math.round(val);
     }
 
+    // Target visible active price span inside .price-main / .price-block / .detail-info
+    const priceMain = document.querySelector('.price-main') || document.querySelector('.price-block') || document.querySelector('.detail-info');
+    if (priceMain) {
+      if (priceMain.innerText.toLowerCase().includes('price hidden') && !priceMain.querySelector('.price-main')) {
+        return null;
+      }
+
+      const elements = Array.from(priceMain.querySelectorAll('*'));
+      let bestCandidate = null;
+
+      for (const el of elements) {
+        const style = window.getComputedStyle(el);
+
+        // Skip hidden honeypots (display: none, opacity: 0, aria-hidden: true)
+        if (style.display === 'none' || style.visibility === 'hidden' || style.opacity === '0' || el.getAttribute('aria-hidden') === 'true') continue;
+        // Skip strikethroughs
+        if (style.textDecoration.includes('line-through') || style.textDecorationLine.includes('line-through')) continue;
+
+        // Skip deal price labels / discount badges / status text / SKU text
+        const txt = (el.innerText || el.textContent || '').trim();
+        if (!txt) continue;
+        if (txt.toLowerCase().includes('deal price') || txt.toLowerCase().includes('off') || txt.toLowerCase().includes('hidden') || txt.toLowerCase().includes('hover') || txt.toLowerCase().includes('sku')) continue;
+
+        // MUST contain an explicit currency symbol ($ € £ ₹ rs inr) to avoid non-currency strings like "2.4rem" or "2.54 kg"
+        if (/(?:[\$€£₹]|rs\.?|inr)/i.test(txt)) {
+          const parsed = parsePriceValue(txt);
+          if (parsed && parsed >= 10) {
+            const fontSize = parseFloat(style.fontSize) || 16;
+            const fontWeight = parseInt(style.fontWeight) || 400;
+            const isPvClass = el.className && typeof el.className === 'string' && el.className.includes('pv-');
+
+            if (!bestCandidate || (isPvClass && !bestCandidate.isPvClass) || fontSize > bestCandidate.fontSize) {
+              bestCandidate = { val: parsed, fontSize, fontWeight, isPvClass, symbol: txt.includes('$') ? '$' : '₹' };
+            }
+          }
+        }
+      }
+
+      if (bestCandidate) {
+        return { price: bestCandidate.val, currency_symbol: bestCandidate.symbol };
+      }
+    }
+
+    // Fallback: Scan visible leaf nodes if .price-main is missing
     const allNodes = Array.from(document.querySelectorAll('*'));
-    const candidates = [];
+    let fallbackBest = null;
 
     for (const node of allNodes) {
-      if (!isVisible(node)) continue;
-      if (isStrikethrough(node)) continue;
-      if (node.children.length > 0) continue; // leaf nodes only
+      const style = window.getComputedStyle(node);
+      if (style.display === 'none' || style.visibility === 'hidden' || style.opacity === '0' || node.getAttribute('aria-hidden') === 'true') continue;
+      if (style.textDecoration.includes('line-through') || style.textDecorationLine.includes('line-through')) continue;
 
       const txt = (node.innerText || node.textContent || '').trim();
       if (!txt) continue;
+      if (txt.toLowerCase().includes('deal price') || txt.toLowerCase().includes('off') || txt.toLowerCase().includes('sku')) continue;
 
-      // REQUIRE explicit currency symbol ($ € £ ₹ rs inr) to avoid SKU numbers, ratings, or stock counts
-      const match = txt.match(/(?:([\$€£₹]|rs\.?|inr))\s*(\d{1,3}(?:,\d{3})*(?:\.\d{1,2})?|\d+(?:\.\d{1,2})?)/i);
-
-      if (match) {
-        const symbol = match[1] || '₹';
-        const rawNum = match[2].replace(/,/g, '');
-        const val = parseFloat(rawNum);
-
-        if (!isNaN(val) && val > 0) {
-          const style = window.getComputedStyle(node);
+      if (/(?:[\$€£₹]|rs\.?|inr)/i.test(txt)) {
+        const parsed = parsePriceValue(txt);
+        if (parsed && parsed >= 10) {
           const fontSize = parseFloat(style.fontSize) || 16;
-          const fontWeight = parseInt(style.fontWeight) || 400;
-
-          // Check if parent or node has price class
-          const pClass = node.parentElement ? (node.parentElement.className || '') : '';
-          const isPriceContainer = typeof pClass === 'string' && (pClass.includes('price') || pClass.includes('amount'));
-
-          candidates.push({
-            val,
-            currency_symbol: symbol,
-            fontSize,
-            fontWeight,
-            isPriceContainer,
-            text: txt
-          });
+          if (!fallbackBest || fontSize > fallbackBest.fontSize) {
+            fallbackBest = { val: parsed, fontSize, symbol: txt.includes('$') ? '$' : '₹' };
+          }
         }
       }
     }
 
-    if (candidates.length === 0) return null;
+    if (fallbackBest) {
+      return { price: fallbackBest.val, currency_symbol: fallbackBest.symbol };
+    }
 
-    // Sort by font size and price container priority
-    candidates.sort((a, b) => (b.fontSize - a.fontSize) || (b.fontWeight - a.fontWeight) || (b.isPriceContainer ? 1 : 0) - (a.isPriceContainer ? 1 : 0));
-
-    return { price: candidates[0].val, currency_symbol: candidates[0].currency_symbol };
+    return null;
   });
 
   return priceData;
@@ -230,7 +263,7 @@ async function extractStockStatus(page) {
  * @param {string} url - Target product URL
  * @param {boolean} [isHeaded=false] - Whether to launch Playwright in headed mode
  * @param {number} [maxRetries=3] - Maximum retry attempts
- * @returns {Promise<{ product_name: string, price: number, in_stock: boolean, image_url: string, attempts: number }>}
+ * @returns {Promise<{ product_name: string, price: number, currency_symbol: string, in_stock: boolean, image_url: string, attempts: number }>}
  */
 async function scrapeProduct(url, isHeaded = false, maxRetries = 3) {
   let attempt = 0;
@@ -246,7 +279,7 @@ async function scrapeProduct(url, isHeaded = false, maxRetries = 3) {
       browser = await chromium.launch({
         headless: !isHeaded,
         slowMo: isHeaded ? 100 : 0,
-        args: ['--no-sandbox', '--disable-setuid-sandbox']
+        args: CHROMIUM_LAUNCH_ARGS
       });
 
       const context = await browser.newContext({
@@ -338,38 +371,34 @@ async function searchProducts(query) {
 
   const demoCatalog = [
     {
-      product_name: 'INE Ultra Wireless Noise-Canceling Headphones',
-      product_url: `${storeBaseUrl}/products/wireless-headphones`,
+      product_name: 'Domus Speaker Neo',
+      product_url: `${storeBaseUrl}/product/963`,
       image_url: 'https://images.unsplash.com/photo-1505740420928-5e560c06d30e?w=500&auto=format&fit=crop&q=80',
-      current_price: 149.99,
+      current_price: 20722,
+      currency_symbol: '₹',
       in_stock: true
     },
     {
       product_name: 'Nordkraft Amplifier Plus',
       product_url: `${storeBaseUrl}/product/407`,
       image_url: 'https://images.unsplash.com/photo-1546435770-a3e426bf472b?w=500&auto=format&fit=crop&q=80',
-      current_price: 15075.00,
+      current_price: 15075,
+      currency_symbol: '₹',
       in_stock: true
     },
     {
-      product_name: 'INE Pro Mechanical RGB Gaming Keyboard',
-      product_url: `${storeBaseUrl}/products/mechanical-keyboard`,
-      image_url: 'https://images.unsplash.com/photo-1587829741301-dc798b83add3?w=500&auto=format&fit=crop&q=80',
-      current_price: 89.50,
+      product_name: 'INE Ultra Wireless Noise-Canceling Headphones',
+      product_url: `${storeBaseUrl}/products/wireless-headphones`,
+      image_url: 'https://images.unsplash.com/photo-1505740420928-5e560c06d30e?w=500&auto=format&fit=crop&q=80',
+      current_price: 149.99,
+      currency_symbol: '$',
       in_stock: true
-    },
-    {
-      product_name: 'INE Ergonomic Smart Watch Series X',
-      product_url: `${storeBaseUrl}/products/smart-watch-x`,
-      image_url: 'https://images.unsplash.com/photo-1523275335684-37898b6baf30?w=500&auto=format&fit=crop&q=80',
-      current_price: 199.00,
-      in_stock: false
     }
   ];
 
   try {
     let browser = null;
-    browser = await chromium.launch({ headless: true });
+    browser = await chromium.launch({ headless: true, args: CHROMIUM_LAUNCH_ARGS });
     const page = await browser.newPage();
     await page.goto(storeBaseUrl, { waitUntil: 'domcontentloaded', timeout: 15000 });
     await handlePopups(page);

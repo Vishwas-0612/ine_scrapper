@@ -394,7 +394,7 @@ router.delete('/products/:id', async (req, res) => {
  */
 router.post('/cron/scrape-all', async (req, res) => {
   const secretHeader = req.headers['x-cron-secret'];
-  const expectedSecret = process.env.CRON_SECRET_KEY || 'ine_scrapper_secret_cron_token_2026';
+  const expectedSecret = process.env.CRON_SECRET_KEY || process.env.CRON_SECRET || 'ine_scrapper_secret_cron_token_2026';
 
   if (secretHeader !== expectedSecret) {
     return res.status(401).json({ success: false, error: 'Unauthorized: Invalid X-Cron-Secret header.' });
