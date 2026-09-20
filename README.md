@@ -176,19 +176,7 @@ node scripts/test-headed.js https://demo.inelabteamdev.com/products/wireless-hea
 
 ---
 
-## 6. Triggering Scheduled Cron Scrapes
-
-You can trigger an automated scrape of all tracked products by sending a POST request to `/api/cron/scrape-all` with the secret header:
-
-```bash
-curl -X POST http://localhost:5000/api/cron/scrape-all \
-  -H "Content-Type: application/json" \
-  -H "X-Cron-Secret: ine_scrapper_secret_cron_token_2026"
-```
-
----
-
-## 7. REST API Endpoints Overview
+## 6. REST API Endpoints Overview
 
 | Method | Endpoint | Description |
 |---|---|---|
