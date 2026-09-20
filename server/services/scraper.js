@@ -1,4 +1,5 @@
 const { chromium } = require('playwright');
+const { execSync } = require('child_process');
 
 /**
  * Helper to pause execution
@@ -12,6 +13,23 @@ const CHROMIUM_LAUNCH_ARGS = [
   '--disable-accelerated-2d-canvas',
   '--disable-gpu'
 ];
+
+let isBrowserInstalled = false;
+
+/**
+ * Self-healing runtime fallback to auto-install Playwright Chromium on cloud hosts (Render/Docker)
+ */
+function ensureBrowserInstalled() {
+  if (isBrowserInstalled) return;
+  try {
+    console.log('[Scraper] Playwright browser missing at runtime. Auto-installing Playwright Chromium...');
+    execSync('npx playwright install', { stdio: 'inherit' });
+    isBrowserInstalled = true;
+    console.log('[Scraper] Runtime Playwright installation complete!');
+  } catch (err) {
+    console.warn('[Scraper WARN] Auto-install runtime fallback note:', err.message);
+  }
+}
 
 /**
  * Handles popup & cookie banner dismissals so overlays never block pointer events
@@ -276,11 +294,24 @@ async function scrapeProduct(url, isHeaded = false, maxRetries = 3) {
     try {
       console.log(`[Scraper] Attempt ${attempt}/${maxRetries} for URL: ${url} (Headed: ${isHeaded})`);
 
-      browser = await chromium.launch({
-        headless: !isHeaded,
-        slowMo: isHeaded ? 100 : 0,
-        args: CHROMIUM_LAUNCH_ARGS
-      });
+      try {
+        browser = await chromium.launch({
+          headless: !isHeaded,
+          slowMo: isHeaded ? 100 : 0,
+          args: CHROMIUM_LAUNCH_ARGS
+        });
+      } catch (launchErr) {
+        if (launchErr.message.includes("Executable doesn't exist") || launchErr.message.includes("Please run the following command")) {
+          ensureBrowserInstalled();
+          browser = await chromium.launch({
+            headless: !isHeaded,
+            slowMo: isHeaded ? 100 : 0,
+            args: CHROMIUM_LAUNCH_ARGS
+          });
+        } else {
+          throw launchErr;
+        }
+      }
 
       const context = await browser.newContext({
         userAgent: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
@@ -398,7 +429,16 @@ async function searchProducts(query) {
 
   try {
     let browser = null;
-    browser = await chromium.launch({ headless: true, args: CHROMIUM_LAUNCH_ARGS });
+    try {
+      browser = await chromium.launch({ headless: true, args: CHROMIUM_LAUNCH_ARGS });
+    } catch (launchErr) {
+      if (launchErr.message.includes("Executable doesn't exist") || launchErr.message.includes("Please run the following command")) {
+        ensureBrowserInstalled();
+        browser = await chromium.launch({ headless: true, args: CHROMIUM_LAUNCH_ARGS });
+      } else {
+        throw launchErr;
+      }
+    }
     const page = await browser.newPage();
     await page.goto(storeBaseUrl, { waitUntil: 'domcontentloaded', timeout: 15000 });
     await handlePopups(page);
