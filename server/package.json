@@ -5,8 +5,8 @@
   "main": "server.js",
   "scripts": {
     "start": "node server.js",
-    "build": "npx playwright install chromium",
-    "postinstall": "npx playwright install chromium",
+    "build": "npx playwright install",
+    "postinstall": "npx playwright install",
     "dev": "node --watch server.js",
     "scrape:headed": "node scripts/test-headed.js"
   },
